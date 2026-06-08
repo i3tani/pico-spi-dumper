@@ -1,9 +1,7 @@
 #include <cstdint>
 #include <cstdio>
-
 #include <pico/stdlib.h>
 #include <pico/stdio_usb.h>
-
 #include "dumper.hpp"
 #include "analyzer.hpp"
 

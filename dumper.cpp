@@ -2,22 +2,42 @@
 #include <pico/stdlib.h>
 #include <hardware/spi.h>
 #include <hardware/gpio.h>
+#include <pico/stdlib.h>
+#include <pico/stdio_usb.h>
 #include "dumper.hpp"
 constexpr size_t CHUNK_SIZE = 4096;
-uint8_t CMD_JEDEC = 0X9F;
-uint8_t CMD_READ = 0X03; // 0x03 + ADDR eg read one byte from addr a1 MOSI: 03 00 00 A1 00
-                                                                    //MISO: ?? ?? ?? ?? 5A
+static uint8_t buffer[CHUNK_SIZE];
+static constexpr uint8_t CMD_JEDEC = 0x9F;
+static constexpr uint8_t CMD_READ  = 0x03;
+static constexpr uint8_t CMD_READ4b  = 0x13;
+// 0x03 + ADDR eg read one byte from addr a1 MOSI: 03 00 00 A1 00
+//MISO: ?? ?? ?? ?? 5A
+struct __attribute__((packed)) DumpHeader {
+    char magic[4];
+    uint8_t version;
+    uint32_t chunkSize;
+};
+
+DumpHeader ender = {
+    .magic = {'D', 'I', 'P', 'S'},
+    .version = 1,
+    .chunkSize = CHUNK_SIZE
+};
+
+DumpHeader hdr = {
+    .magic = {'S', 'P', 'I', 'D'},
+    .version = 1,
+    .chunkSize = CHUNK_SIZE
+};
 struct JedecId {
     uint8_t manufacturer;
     uint8_t memoryType;
     uint8_t capacity;
 
     uint32_t sizeBytes() const {
-        // Capacity byte encoding used by most SPI NOR chips:
-        // 0x17 = 2^23 bytes = 8 MiB
-        // 0x18 = 2^24 bytes = 16 MiB
-        // 0x19 = 2^25 bytes = 32 MiB
-        return 1u << capacity;
+        if (capacity >= 32)
+            return 0;
+        return 1UL << capacity;
     }
 
     bool requires4ByteAddressing() const {
@@ -27,10 +47,6 @@ struct JedecId {
         return !(manufacturer == 0xff && memoryType == 0xff && capacity == 0xff) && !(manufacturer == 0x00 && memoryType == 0x00 && capacity == 0x00);
     }
 };
-
-
-
-
 class SPIFlash {
 private:
     spi_inst_t* spi_port = spi0;
@@ -41,12 +57,13 @@ private:
     uint baudrate = 10000000;
 
 public:
+    bool fourByte = false;
     SPIFlash();
     ~SPIFlash();
     void select();
     void deselect();
     JedecId readID();
-    void readDataFromAddr(uint32_t addr, uint8_t* buffer, size_t lenght);
+    void readDataFromAddr(uint32_t addr, uint8_t* buffer, size_t length);
 };
 
 SPIFlash::SPIFlash() {
@@ -90,21 +107,26 @@ JedecId SPIFlash::readID() {
 }
 
 void SPIFlash::readDataFromAddr(uint32_t addr, uint8_t* buffer, size_t length){
-    uint8_t cmd[4];
-    cmd[0]=CMD_READ;
-    cmd[1]=(addr >> 16) & 0xFF;
-    cmd[2]=(addr >> 8) & 0xFF;
-    cmd[3]= addr & 0xFF;
+    uint8_t cmd[5];
+    size_t cmdLen;
+    if (fourByte) {
+        cmd[0] = CMD_READ4b;
+        cmd[1] = (addr >> 24) & 0xFF;
+        cmd[2] = (addr >> 16) & 0xFF;
+        cmd[3] = (addr >> 8)  & 0xFF;
+        cmd[4] =  addr        & 0xFF;
+        cmdLen = 5;
+    } else {
+        cmd[0] = CMD_READ;
+        cmd[1] = (addr >> 16) & 0xFF;
+        cmd[2] = (addr >> 8)  & 0xFF;
+        cmd[3] =  addr        & 0xFF;
+        cmdLen = 4;
+    }
     select();
-    spi_write_blocking(spi_port, cmd, sizeof(cmd));
-    spi_read_blocking(spi_port,0x00,buffer,length);
-    deselect();
-
-    /*Intended Usage (Mostly for debugging)
-            uint8_t buf[256];
-            flash.readData(0, buf, sizeof(buf));
-            dumpBuffer(buf, sizeof(buf)); still have to implement this
-    */
+    spi_write_blocking(spi_port, cmd, cmdLen);
+    spi_read_blocking(spi_port, 0x00, buffer, length);   // ← restore this
+    deselect();                                          // ← and this
 }
 
 void FwDumper::run() {
@@ -115,9 +137,21 @@ void FwDumper::run() {
         printf("NO FLASH DETECTED\n");
         return;
     }
+    flash.fourByte = id.requires4ByteAddressing();
     printf("JEDEC: %02X %02X %02X\n",id.manufacturer,id.memoryType,id.capacity);
     printf("Size: %u bytes\n",id.sizeBytes());
     printf("Address mode: %s\n",id.requires4ByteAddressing() ? "4-byte" : "3-byte");
+    printf("DUMPING START\n");
+    uint32_t totalSize = id.sizeBytes();
+    fwrite(&hdr, sizeof(hdr), 1, stdout);
+    fflush(stdout);
+    for(uint32_t addr = 0; addr < totalSize; addr += CHUNK_SIZE){
+        size_t chunkSize = (addr + CHUNK_SIZE <= totalSize) ? CHUNK_SIZE : (totalSize - addr);
+        flash.readDataFromAddr(addr, buffer, chunkSize);
+        fwrite(buffer, 1, chunkSize, stdout);      
+    }
+    fwrite(&ender, sizeof(ender), 1, stdout);
+    fflush(stdout);
 }
 
 
